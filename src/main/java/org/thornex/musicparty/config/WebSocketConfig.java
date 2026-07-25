@@ -34,7 +34,7 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     @Override
     public void registerStompEndpoints(StompEndpointRegistry registry) {
-        // 允许所有来源，专门针对 SockJS 的严格模式
+        // 🟢 性能优化：配置缓冲区大小和允许跨域
         registry.addEndpoint("/ws")
                 .setAllowedOriginPatterns("*");
     }

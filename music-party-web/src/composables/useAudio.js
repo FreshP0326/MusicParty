@@ -173,7 +173,26 @@ export function useAudio(audioRef, playerStore) {
         document.addEventListener('visibilitychange', handleVisibilityChange);
         window.addEventListener('online', handleNetworkChange);
 
-        syncTimer = setInterval(() => {
+        // 自适应同步间隔：前台500ms，后台2000ms
+        let syncIntervalId = null;
+        let currentInterval = 500;
+
+        const updateSyncInterval = () => {
+            const newInterval = document.hidden ? 2000 : 500;
+            if (newInterval !== currentInterval) {
+                currentInterval = newInterval;
+                if (syncIntervalId) {
+                    clearInterval(syncIntervalId);
+                }
+                syncIntervalId = setInterval(syncLogic, currentInterval);
+                console.log(`[Sync] Interval changed to ${currentInterval}ms`);
+            }
+        };
+
+        // 监听可见性变化，动态调整间隔
+        document.addEventListener('visibilitychange', updateSyncInterval);
+
+        const syncLogic = () => {
             if (!playerStore.nowPlaying) {
                 localProgress.value = 0;
                 return;
@@ -205,7 +224,7 @@ export function useAudio(audioRef, playerStore) {
                     const domTime = audioRef.value.currentTime * 1000;
                     // 动态调整阈值：前台 2s，后台 10s (避免后台节流导致的频繁 seek 卡顿)
                     const threshold = document.hidden ? 10000 : 2000;
-                    
+
                     if (Math.abs(domTime - targetTime) > threshold) {
                         if (audioRef.value.readyState >= 2) {
                             console.log(`[Sync] Correcting time (${document.hidden ? 'bg' : 'fg'}): ${domTime} -> ${targetTime}`);
@@ -214,14 +233,21 @@ export function useAudio(audioRef, playerStore) {
                     }
                 }
             }
-        }, 200);
-    });
+        };
 
-    onUnmounted(() => {
-        document.removeEventListener('visibilitychange', handleVisibilityChange);
-        window.removeEventListener('online', handleNetworkChange);
-        clearInterval(syncTimer);
-        releaseWakeLock();
+        // 启动初始定时器
+        syncIntervalId = setInterval(syncLogic, currentInterval);
+
+        // 存储清理函数
+        onUnmounted(() => {
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+            document.removeEventListener('visibilitychange', updateSyncInterval);
+            window.removeEventListener('online', handleNetworkChange);
+            if (syncIntervalId) {
+                clearInterval(syncIntervalId);
+            }
+            releaseWakeLock();
+        });
     });
 
     return {

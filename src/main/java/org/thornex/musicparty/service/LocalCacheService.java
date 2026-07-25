@@ -17,6 +17,7 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
+import reactor.util.concurrent.Queues;
 
 import java.io.File;
 import java.io.IOException;
@@ -36,13 +37,16 @@ public class LocalCacheService {
 
     private final WebClient webClient;
     private static final long DOWNLOAD_COOLDOWN_SECONDS = 3;
+    private static final int MAX_QUEUE_SIZE = 256; // 限制下载队列大小
 
     // 内存中维护缓存文件的元数据
     private final Map<String, CacheEntry> cacheIndex = new ConcurrentHashMap<>();
     private final AtomicLong currentTotalSize = new AtomicLong(0);
     private final ApplicationEventPublisher eventPublisher;
     private final AppProperties appProperties;
-    private final Sinks.Many<DownloadTask> downloadQueue = Sinks.many().unicast().onBackpressureBuffer();
+    private final Sinks.Many<DownloadTask> downloadQueue = Sinks.many().unicast().onBackpressureBuffer(
+            Queues.<DownloadTask>small().get() // 使用有界队列，默认256
+    );
     private Disposable queueSubscription;
 
     private record DownloadTask(
@@ -119,6 +123,7 @@ public class LocalCacheService {
      * @param extension 文件扩展名 (如 .m4a, .mp3)
      */
     public void submitDownload(String musicId, Mono<String> urlProvider, Map<String, String> headers, String extension) {
+        // 1. 检查是否已缓存
         if (cacheIndex.containsKey(musicId) && cacheIndex.get(musicId).getStatus() == CacheStatus.COMPLETED) {
             log.info("Music {} already cached.", musicId);
             touch(musicId); // 更新访问时间
@@ -146,7 +151,11 @@ public class LocalCacheService {
         Sinks.EmitResult result = downloadQueue.tryEmitNext(new DownloadTask(musicId, urlProvider, headers, extension));
 
         if (result.isFailure()) {
-            log.error("Failed to enqueue download task for {}", musicId);
+            if (result == Sinks.EmitResult.FAIL_OVERFLOW) {
+                log.warn("Download queue full (max {}), rejecting task: {}", MAX_QUEUE_SIZE, musicId);
+            } else {
+                log.error("Failed to enqueue download task for {}: {}", musicId, result);
+            }
             entry.setStatus(CacheStatus.FAILED);
             eventPublisher.publishEvent(new DownloadStatusEvent(this, musicId));
         } else {

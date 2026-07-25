@@ -68,7 +68,12 @@ public class MusicPlayerService {
     private static final long GLOBAL_COOLDOWN_MS = 1000;
     private static final long IDLE_RESET_TIMEOUT_MS = Duration.ofHours(2).toMillis();
 
+    // 广播限流
+    private final AtomicLong lastBroadcastTime = new AtomicLong(0);
+    private static final long BROADCAST_THROTTLE_MS = 200;
+
     private final AtomicLong playHeadVersion = new AtomicLong(0);
+    private final AtomicBoolean playNextLock = new AtomicBoolean(false);
 
     public MusicPlayerService(List<IMusicApiService> apiServices, UserService userService,
                               LocalCacheService localCacheService,
@@ -132,46 +137,54 @@ public class MusicPlayerService {
         }
     }
 
-    private synchronized void playNextInQueue() {
-        if (currentMusic.get() != null || isLoading.get()) {
+    private void playNextInQueue() {
+        // 尝试获取锁，失败直接返回，防止并发问题
+        if (!playNextLock.compareAndSet(false, true)) {
+            log.debug("playNextInQueue already in progress, skipping");
             return;
         }
-
-        Map<String, QueueItemStatus> statusMap = buildStatusMap();
-
-        Set<String> onlineUserTokens = userService.getRecentlyActiveUserTokens();
-
-        MusicQueueItem nextItem = queueManager.pollNext(isShuffle.get(), statusMap, onlineUserTokens);
-
-        if (nextItem == null) {
-            if (isLoading.get()) {
-                isLoading.set(false);
-            }
-            broadcastFullPlayerState();
-            return;
-        }
-
-        // Handle failed items
-        if (nextItem.status() == QueueItemStatus.FAILED ||
-                (statusMap.get(nextItem.music().id()) == QueueItemStatus.FAILED)) {
-            log.warn("Skipping failed song: {}", nextItem.music().name());
-            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.ERROR_LOAD, "SYSTEM", "加载失败: " + nextItem.music().name()));
-            playNextInQueue(); // Recursively try next
-            return;
-        }
-
-        // 增加版本号，这表示"开始一次新的播放尝试"
-        long currentVersion = playHeadVersion.incrementAndGet();
-        isLoading.set(true);
-        broadcastFullPlayerState();
-        isPaused.set(false);
-
-        log.info("Playing next: {}", nextItem.music().name());
 
         try {
+            if (currentMusic.get() != null || isLoading.get()) {
+                return;
+            }
+
+            Map<String, QueueItemStatus> statusMap = buildStatusMap();
+
+            Set<String> onlineUserTokens = userService.getRecentlyActiveUserTokens();
+
+            MusicQueueItem nextItem = queueManager.pollNext(isShuffle.get(), statusMap, onlineUserTokens);
+
+            if (nextItem == null) {
+                if (isLoading.get()) {
+                    isLoading.set(false);
+                }
+                broadcastFullPlayerState();
+                return;
+            }
+
+            // Handle failed items
+            if (nextItem.status() == QueueItemStatus.FAILED ||
+                    (statusMap.get(nextItem.music().id()) == QueueItemStatus.FAILED)) {
+                log.warn("Skipping failed song: {}", nextItem.music().name());
+                eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.ERROR_LOAD, "SYSTEM", "加载失败: " + nextItem.music().name()));
+                playNextLock.set(false); // 释放锁后递归
+                playNextInQueue(); // Recursively try next
+                return;
+            }
+
+            // 增加版本号，这表示"开始一次新的播放尝试"
+            long currentVersion = playHeadVersion.incrementAndGet();
+            isLoading.set(true);
+            broadcastFullPlayerState();
+            isPaused.set(false);
+
+            log.info("Playing next: {}", nextItem.music().name());
+
             IMusicApiService service = getApiService(nextItem.music().platform());
             service.getPlayableMusic(nextItem.music().id())
                     .timeout(Duration.ofSeconds(10))
+                    .doFinally(signal -> playNextLock.set(false)) // 确保锁总是被释放
                     .subscribe(
                             playableMusic -> {
                                 // 检查版本号是否匹配
@@ -183,15 +196,16 @@ public class MusicPlayerService {
                                 }
                             },
                             error -> {
-                        log.error("Play failed for {}: {}", nextItem.music().name(), error.getMessage());
-                        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.ERROR_LOAD, "SYSTEM", nextItem.music().name()));
-                        isLoading.set(false);
-                        broadcastFullPlayerState();
-                        playNextInQueue();
-                    });
+                                log.error("Play failed for {}: {}", nextItem.music().name(), error.getMessage());
+                                eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.ERROR_LOAD, "SYSTEM", nextItem.music().name()));
+                                isLoading.set(false);
+                                broadcastFullPlayerState();
+                                playNextInQueue();
+                            });
         } catch (Exception e) {
             log.error("Unexpected error in playNextInQueue", e);
             isLoading.set(false);
+            playNextLock.set(false); // 确保异常时释放锁
             broadcastFullPlayerState();
         }
     }
@@ -619,7 +633,18 @@ public class MusicPlayerService {
     }
 
     public void broadcastFullPlayerState() {
-        eventPublisher.publishEvent(new PlayerStateEvent(this, getCurrentPlayerState()));
+        // 广播限流：最多每200ms广播一次，避免高频广播占用带宽
+        long now = System.currentTimeMillis();
+        long last = lastBroadcastTime.get();
+
+        if (now - last < BROADCAST_THROTTLE_MS) {
+            log.debug("Broadcast throttled, skipping");
+            return;
+        }
+
+        if (lastBroadcastTime.compareAndSet(last, now)) {
+            eventPublisher.publishEvent(new PlayerStateEvent(this, getCurrentPlayerState()));
+        }
     }
 
     public void broadcastOnlineUsers() {

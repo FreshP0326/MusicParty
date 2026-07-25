@@ -10,8 +10,11 @@ import org.thornex.musicparty.enums.QueueItemStatus;
 import org.thornex.musicparty.enums.TopResult;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -23,8 +26,12 @@ public class MusicQueueManager {
     private final Deque<MusicQueueItem> queue = new ConcurrentLinkedDeque<>();
     private final List<Music> playHistory = Collections.synchronizedList(new LinkedList<>());
 
-    // 用于实现“公平随机播放”：记录上一个播放的用户
+    // 用于实现公平随机播放：记录上一个播放的用户
     private final AtomicReference<String> lastPlayedUserToken = new AtomicReference<>("");
+
+    // 🟢 性能优化：缓存用户歌曲分组，避免每次重建
+    private final Map<String, List<MusicQueueItem>> userSongsCache = new ConcurrentHashMap<>();
+    private final AtomicBoolean cacheInvalidated = new AtomicBoolean(true);
 
     // --- Public API for Queue Manipulation ---
 
@@ -49,6 +56,10 @@ public class MusicQueueManager {
                 initialStatus // 存储枚举的名称
         );
         queue.addLast(newItem);
+
+        // 🟢 更新缓存
+        cacheInvalidated.set(true);
+
         return newItem;
     }
 
@@ -142,7 +153,11 @@ public class MusicQueueManager {
         String idToFind = stripPrefix(queueId);
 
         Optional<MusicQueueItem> itemOpt = findByQueueId(idToFind);
-        itemOpt.ifPresent(queue::remove);
+        if (itemOpt.isPresent()) {
+            queue.remove(itemOpt.get());
+            // 🟢 更新缓存
+            cacheInvalidated.set(true);
+        }
         return itemOpt;
     }
 
@@ -192,17 +207,40 @@ public class MusicQueueManager {
     }
 
     /**
-     * "公平"随机播放算法：严格轮询 (Strict Round-Robin) + 在线优先 + 个人置顶优先
+     * "公平"随机播放算法：严格轮询 (Strict Round-Robin) + 在线优先 + 个人置顶优先 - 优化版本
      */
     private MusicQueueItem pollNextFairShuffle(List<MusicQueueItem> availableItems, Set<String> onlineUserTokens) {
-        // 1. 按用户分组
-        Map<String, List<MusicQueueItem>> userSongsMap = new HashMap<>();
-        for (MusicQueueItem item : availableItems) {
-            userSongsMap.computeIfAbsent(item.enqueuedBy().token(), k -> new ArrayList<>()).add(item);
+        // 🟢 性能优化：使用缓存或重建用户分组
+        Map<String, List<MusicQueueItem>> userSongsMap;
+
+        if (cacheInvalidated.get()) {
+            // 缓存失效，重建
+            userSongsMap = new HashMap<>();
+            for (MusicQueueItem item : availableItems) {
+                userSongsMap.computeIfAbsent(item.enqueuedBy().token(), k -> new ArrayList<>()).add(item);
+            }
+            userSongsCache.clear();
+            userSongsCache.putAll(userSongsMap);
+            cacheInvalidated.set(false);
+        } else {
+            // 使用缓存，但过滤出 availableItems
+            userSongsMap = new HashMap<>();
+            Set<String> availableIds = availableItems.stream()
+                    .map(MusicQueueItem::queueId)
+                    .collect(Collectors.toSet());
+
+            for (Map.Entry<String, List<MusicQueueItem>> entry : userSongsCache.entrySet()) {
+                List<MusicQueueItem> filtered = entry.getValue().stream()
+                        .filter(item -> availableIds.contains(item.queueId()))
+                        .collect(Collectors.toList());
+                if (!filtered.isEmpty()) {
+                    userSongsMap.put(entry.getKey(), filtered);
+                }
+            }
         }
 
         List<String> allUserTokens = new ArrayList<>(userSongsMap.keySet());
-        
+
         // 2. 筛选目标用户池：优先在线用户
         List<String> onlineCandidates = allUserTokens.stream()
                 .filter(onlineUserTokens::contains)
@@ -288,10 +326,16 @@ public class MusicQueueManager {
         queue.clear();
         playHistory.clear();
         lastPlayedUserToken.set("");
+        // 🟢 清理缓存
+        userSongsCache.clear();
+        cacheInvalidated.set(true);
     }
 
     public synchronized void clearPendingQueue() {
         queue.clear();
+        // 🟢 清理缓存
+        userSongsCache.clear();
+        cacheInvalidated.set(true);
     }
 
     public List<MusicQueueItem> getQueueSnapshot() {

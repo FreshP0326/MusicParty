@@ -88,24 +88,28 @@ public class ChatService {
     }
 // ... existing code ...
     /**
-     * 分页获取历史记录 (从最新往旧推)
+     * 分页获取历史记录 (从最新往旧推) - 优化版本
      * @param offset 跳过最近的多少条
      * @param limit 取多少条
      */
     public List<ChatMessage> getHistory(int offset, int limit) {
-        // 我们将其转为 List 进行倒序切片处理
-        List<ChatMessage> snapshot = new ArrayList<>(history);
-        Collections.reverse(snapshot);
+        // 使用迭代器倒序遍历，避免完整复制
+        List<ChatMessage> result = new ArrayList<>(limit);
+        Iterator<ChatMessage> it = history.descendingIterator();
 
-        if (offset >= snapshot.size()) {
-            return Collections.emptyList();
+        // 跳过 offset 条
+        for (int i = 0; i < offset && it.hasNext(); i++) {
+            it.next();
         }
 
-        int end = Math.min(offset + limit, snapshot.size());
-        List<ChatMessage> page = snapshot.subList(offset, end);
+        // 取 limit 条
+        for (int i = 0; i < limit && it.hasNext(); i++) {
+            result.add(it.next());
+        }
 
-        Collections.reverse(page);
-        return page;
+        // 反转结果（因为我们是倒序遍历的）
+        Collections.reverse(result);
+        return result;
     }
 
     /**

@@ -24,15 +24,23 @@ export class AudioVisualizer {
         this.roughnessMultiplier = 1.0;
 
         // 配置参数 (Performance Optimized)
-        this.breatheBars = 60; // Reduced from 120
+        // 🟢 根据设备性能自适应调整
+        const isLowEnd = navigator.hardwareConcurrency <= 4;
+        this.breatheBars = isLowEnd ? 30 : 60; // 低端设备减半
         this.breatheRadiusBase = 180;
 
-        // 圆环定义
-        this.rings = [
+        // 圆环定义 - 低端设备减少一个环
+        this.rings = isLowEnd ? [
+            { radius: 450, baseWidth: 5, maxWidth: 150, speed: -0.015, offset: 0, segments: 3 },
+            { radius: 450, baseWidth: 10, maxWidth: 100, speed: 0.02, offset: 2, segments: 4 }
+        ] : [
             { radius: 450, baseWidth: 5, maxWidth: 150, speed: -0.015, offset: 0, segments: 3 },
             { radius: 450, baseWidth: 10, maxWidth: 100, speed: 0.02, offset: 2, segments: 4 },
             { radius: 450, baseWidth: 8, maxWidth: 80, speed: 0.03, offset: 4, segments: 5 }
         ];
+
+        // 🟢 采样点数量优化
+        this.ringSegmentCount = isLowEnd ? 60 : 120;
     }
 
     /**
@@ -100,8 +108,11 @@ export class AudioVisualizer {
         const { ctx, width, height, center } = this;
         ctx.clearRect(0, 0, width, height);
 
-        // 如果不播放且没有爆发，可以降低渲染频率或跳过部分渲染（为了简单起见，这里保持 loop 但降低计算量）
-        
+        // 🟢 完全静止时不渲染，节省GPU
+        if (!this.isPlaying && this.speedMultiplier < 1.01 && this.smoothAlpha < 0.02) {
+            return;
+        }
+
         const decayFactor = 0.005;
 
         this.speedMultiplier += (1.0 - this.speedMultiplier) * decayFactor;
@@ -132,7 +143,7 @@ export class AudioVisualizer {
 
         this.rings.forEach((ring) => {
             ctx.beginPath();
-            const count = 120; // Reduced from 240
+            const count = this.ringSegmentCount; // 使用优化后的采样点数
             const currentMaxWidth = ring.maxWidth * this.smoothWidthScale * this.roughnessMultiplier;
 
             // 外圈
